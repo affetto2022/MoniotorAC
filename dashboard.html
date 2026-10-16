@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Monitor Gamma Exposure</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root { color-scheme: light dark; --bg:#fff; --fg:#1a1a1a; --card:#f3f4f6; --mut:#6b7280; --ok:#16a34a; --bad:#dc2626; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111418; --fg:#e5e7eb; --card:#1c2128; --mut:#9ca3af; } }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font-family:system-ui,sans-serif; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--mut); font-size:13px; margin-bottom:12px; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:10px; margin-bottom:12px; }
+  .card { background:var(--card); border-radius:8px; padding:10px 12px; }
+  .card b { display:block; font-size:22px; margin-top:2px; }
+  .card span { color:var(--mut); font-size:12px; }
+  .box { background:var(--card); border-radius:8px; padding:12px; margin-bottom:12px; }
+  canvas { max-height:380px; }
+  #log div { padding:4px 0; border-bottom:1px solid #8884; font-size:14px; }
+  button { padding:6px 12px; border-radius:6px; border:0; background:#2563eb; color:#fff; cursor:pointer; }
+</style>
+</head>
+<body>
+<h1 id="title">Gamma Exposure por Strike</h1>
+<div class="sub">Atualiza a cada 5 min · <span id="ts">—</span> · próxima em <span id="cd">—</span> · <button onclick="enableAlerts()">Ativar alertas</button></div>
+
+<div class="cards">
+  <div class="card"><span>Último preço</span><b id="spot">—</b></div>
+  <div class="card"><span>Gamma Flip</span><b id="flip">—</b></div>
+  <div class="card"><span>Regime</span><b id="reg">—</b></div>
+  <div class="card"><span>Call Wall</span><b id="cw">—</b></div>
+  <div class="card"><span>Put Wall</span><b id="pw">—</b></div>
+  <div class="card"><span>GEX total</span><b id="tot">—</b></div>
+</div>
+
+<div class="box"><canvas id="chart"></canvas></div>
+<div class="box"><b>Alterações detectadas</b><div id="log"><div style="color:var(--mut)">Nenhuma ainda.</div></div></div>
+
+<script>
+const INTERVAL = 300000;          // 5 min
+const FLIP_THRESHOLD = 0.25;      // variação mínima do flip para alertar
+let chart, prev = null, next = Date.now() + INTERVAL, alertsOn = false;
+try { prev = JSON.parse(localStorage.getItem("gex_prev")); } catch (e) {}
+
+const $ = id => document.getElementById(id);
+const fmtM = v => (v / 1e6).toFixed(1) + "M";
+
+function enableAlerts() {
+  alertsOn = true;
+  if ("Notification" in window) Notification.requestPermission();
+  beep();
+}
+function beep() {
+  try {
+    const c = new AudioContext(), o = c.createOscillator();
+    o.connect(c.destination); o.frequency.value = 880; o.start(); o.stop(c.currentTime + 0.25);
+  } catch (e) {}
+}
+function notify(msgs) {
+  const t = new Date().toLocaleTimeString("pt-BR");
+  const log = $("log");
+  if (log.firstChild && log.firstChild.style) log.innerHTML = "";
+  msgs.forEach(m => { const d = document.createElement("div"); d.textContent = t + " — " + m; log.prepend(d); });
+  if (alertsOn) {
+    beep();
+    if ("Notification" in window && Notification.permission === "granted")
+      new Notification("Gamma Exposure", { body: msgs.join("\n") });
+  }
+}
+function detect(d) {
+  if (!prev) return;
+  const m = [];
+  if (d.flip != null && prev.flip != null && Math.abs(d.flip - prev.flip) >= FLIP_THRESHOLD)
+    m.push(`Gamma Flip ${prev.flip.toFixed(2)} → ${d.flip.toFixed(2)}`);
+  if (d.call_wall !== prev.call_wall) m.push(`Call Wall ${prev.call_wall} → ${d.call_wall}`);
+  if (d.put_wall !== prev.put_wall) m.push(`Put Wall ${prev.put_wall} → ${d.put_wall}`);
+  if ((d.spot > d.flip) !== (prev.spot > prev.flip))
+    m.push(d.spot > d.flip ? "Preço cruzou o Flip para CIMA (gamma positivo)" : "Preço cruzou o Flip para BAIXO (gamma negativo)");
+  if (m.length) notify(m);
+}
+function draw(d) {
+  const colors = d.gex.map(v => v >= 0 ? "#2563eb" : "#f59e0b");
+  const agg = d.grid.map((x, i) => ({ x, y: d.agg[i] }));
+  const bars = d.strikes.map((x, i) => ({ x, y: d.gex[i] }));
+  const cfg = {
+    data: { datasets: [
+      { type: "bar", label: "Gamma Exposure por strike", data: bars, backgroundColor: colors, barThickness: 5, yAxisID: "y" },
+      { type: "line", label: "Gamma agregado (varrendo o preço)", data: agg, borderColor: "#38bdf8", pointRadius: 0, tension: .3, yAxisID: "y1" }
+    ] },
+    options: { animation: false, parsing: false, scales: {
+      x: { type: "linear", title: { display: true, text: "Strike / Preço" }, min: d.grid[0], max: d.grid[d.grid.length - 1] },
+      y: { position: "left", ticks: { callback: fmtM } },
+      y1: { position: "right", grid: { drawOnChartArea: false }, ticks: { callback: fmtM } }
+    }, plugins: { annotation: false } },
+    plugins: [{ id: "lines", afterDraw(c) {
+      const { ctx, chartArea: a, scales: s } = c;
+      [[d.flip, "#dc2626", "Flip " + (d.flip ?? 0).toFixed(2)], [d.spot, "#16a34a", "Último " + d.spot.toFixed(2)]].forEach(([v, col, txt]) => {
+        if (v == null) return;
+        const x = s.x.getPixelForValue(v);
+        ctx.save(); ctx.strokeStyle = col; ctx.fillStyle = col; ctx.beginPath(); ctx.moveTo(x, a.top); ctx.lineTo(x, a.bottom); ctx.stroke();
+        ctx.fillText(txt, x + 4, a.top + 12); ctx.restore();
+      });
+    } }]
+  };
+  if (chart) chart.destroy();
+  chart = new Chart($("chart"), cfg);
+}
+function render(d) {
+  $("title").textContent = d.ticker + " — Gamma Exposure por Strike";
+  $("ts").textContent = "dados de " + d.ts.replace("T", " ");
+  $("spot").textContent = d.spot.toFixed(2);
+  $("flip").textContent = d.flip != null ? d.flip.toFixed(2) : "n/d";
+  const pos = d.flip == null || d.spot > d.flip;
+  $("reg").textContent = pos ? "Gamma +" : "Gamma −";
+  $("reg").style.color = pos ? "var(--ok)" : "var(--bad)";
+  $("cw").textContent = d.call_wall; $("pw").textContent = d.put_wall;
+  $("tot").textContent = fmtM(d.total_gex);
+  draw(d);
+}
+async function load() {
+  try {
+    const d = await (await fetch("data.json?t=" + Date.now())).json();
+    if (!prev || prev.ts !== d.ts) { detect(d); render(d); }
+    prev = d; localStorage.setItem("gex_prev", JSON.stringify(d));
+  } catch (e) { $("ts").textContent = "erro ao ler data.json (o gex.py está rodando?)"; }
+  next = Date.now() + INTERVAL;
+}
+setInterval(() => { const s = Math.max(0, Math.round((next - Date.now()) / 1000)); $("cd").textContent = Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); }, 1000);
+load(); setInterval(load, INTERVAL);
+</script>
+</body>
+</html>
